@@ -1,131 +1,70 @@
-#Analyzes text in a document stored in an S3 bucket. Display polygon box around text and angled text 
 import boto3
-import io
-from io import BytesIO
-import sys
+import pandas as pd
+from DateParser import DateParser
+import time
 
-import math
-from PIL import Image, ImageDraw, ImageFont
+class Receipt(DateParser):
+    """A Receipt Class that reads a receipt image, sends it to AWS Textract
+    and parses out the required data for DGII report 606"""
 
-def ShowBoundingBox(draw,box,width,height,boxColor):
-             
-    left = width * box['Left']
-    top = height * box['Top'] 
-    draw.rectangle([left,top, left + (width * box['Width']), top +(height * box['Height'])],outline=boxColor)   
-
-def ShowSelectedElement(draw,box,width,height,boxColor):
-             
-    left = width * box['Left']
-    top = height * box['Top'] 
-    draw.rectangle([left,top, left + (width * box['Width']), top +(height * box['Height'])],fill=boxColor)  
-
-# Displays information about a block returned by text detection and text analysis
-def DisplayBlockInformation(block):
-    print('Id: {}'.format(block['Id']))
-    if 'Text' in block:
-        print('    Detected: ' + block['Text'])
-    print('    Type: ' + block['BlockType'])
-   
-    if 'Confidence' in block:
-        print('    Confidence: ' + "{:.2f}".format(block['Confidence']) + "%")
-
-    if block['BlockType'] == 'CELL':
-        print("    Cell information")
-        print("        Column:" + str(block['ColumnIndex']))
-        print("        Row:" + str(block['RowIndex']))
-        print("        Column Span:" + str(block['ColumnSpan']))
-        print("        RowSpan:" + str(block['ColumnSpan']))    
+    def __init__(self, s3_filename: str):
+        self.s3BucketName = "receipt-parsing-mvp"
+        self.filename = s3_filename
     
-    if 'Relationships' in block:
-        print('    Relationships: {}'.format(block['Relationships']))
-    print('    Geometry: ')
-    print('        Bounding Box: {}'.format(block['Geometry']['BoundingBox']))
-    print('        Polygon: {}'.format(block['Geometry']['Polygon']))
-    
-    if block['BlockType'] == "KEY_VALUE_SET":
-        print ('    Entity Type: ' + block['EntityTypes'][0])
-    
-    if block['BlockType'] == 'SELECTION_ELEMENT':
-        print('    Selection element detected: ', end='')
+    def scan_file(self):
+        """Call Amazon Textract to get text & data from file"""
+        # Amazon Textract client
+        # The Textract client has a .detect_document_text method
+        # and an .analyze_document method for JPG and PNG
+        # and asynchronous version of the above for PDFs
+        textract = boto3.client('textract')
 
-        if block['SelectionStatus'] =='SELECTED':
-            print('Selected')
+        filetype = self.filename.split(".")[-1]
+        # If file is PDF
+        if filetype == "pdf":
+            start_job_response = textract.start_document_analysis(
+                DocumentLocation = {
+                    "S3Object": {
+                        'Bucket': self.s3BucketName,
+                        'Name': self.filename
+                    }
+                },
+                FeatureTypes = ["TABLES"],
+            )
+            job_completed = False
+            while job_completed == False:
+                time.sleep(10)
+                response = textract.get_document_analysis(
+                    JobId=start_job_response["JobId"],
+                    MaxResults=10
+                )
+                if response["JobStatus"] != 'IN_PROGRESS':
+                    job_completed = True
+
+        # If file is JPG or PNG
         else:
-            print('Not selected')    
-    
-    if 'Page' in block:
-        print('Page: ' + block['Page'])
-    print()
+            response = textract.detect_document_text(
+                Document={
+                    'S3Object': {
+                        'Bucket': self.s3BucketName,
+                        'Name': self.filename
+                    }
+                },
+                # FeatureTypes=["FORMS", "TABLES"]
+            )
 
-def process_text_analysis(bucket, document):
+        print(response)
+        self.blocks = response["Blocks"]
+        self.df = pd.DataFrame(self.blocks)
 
-    #Get the document from S3
-    s3_connection = boto3.resource('s3')
-                          
-    s3_object = s3_connection.Object(bucket,document)
-    s3_response = s3_object.get()
+        print(str(self.df.loc[self.df["BlockType"] == "LINE"].shape[0]) + " Lines")
+        print(str(self.df.loc[self.df["BlockType"] == "WORD"].shape[0]) + " Words")
+        print(str(self.df.loc[self.df["BlockType"] == "KEY_VALUE_SET"].shape[0]) + " Key Value Sets")
+        print(self.df.info())
 
-    stream = io.BytesIO(s3_response['Body'].read())
-    image=Image.open(stream)
-
-    # Analyze the document
-    client = boto3.client('textract')
-    
-    image_binary = stream.getvalue()
-    response = client.analyze_document(Document={'Bytes': image_binary},
-        FeatureTypes=["TABLES", "FORMS"])
-  
-
-    # Alternatively, process using S3 object
-    #response = client.analyze_document(
-    #    Document={'S3Object': {'Bucket': bucket, 'Name': document}},
-    #    FeatureTypes=["TABLES", "FORMS"])
-
-    
-    #Get the text blocks
-    blocks=response['Blocks']
-    width, height =image.size  
-    draw = ImageDraw.Draw(image)  
-    print ('Detected Document Text')
-   
-    # Create image showing bounding box/polygon the detected lines/text
-    for block in blocks:
-
-        DisplayBlockInformation(block)
-             
-        draw=ImageDraw.Draw(image)
-        if block['BlockType'] == "KEY_VALUE_SET":
-            if block['EntityTypes'][0] == "KEY":
-                ShowBoundingBox(draw, block['Geometry']['BoundingBox'],width,height,'red')
-            else:
-                ShowBoundingBox(draw, block['Geometry']['BoundingBox'],width,height,'green')  
-            
-        if block['BlockType'] == 'TABLE':
-            ShowBoundingBox(draw, block['Geometry']['BoundingBox'],width,height, 'blue')
-
-        if block['BlockType'] == 'CELL':
-            ShowBoundingBox(draw, block['Geometry']['BoundingBox'],width,height, 'yellow')
-        if block['BlockType'] == 'SELECTION_ELEMENT':
-            if block['SelectionStatus'] =='SELECTED':
-                ShowSelectedElement(draw, block['Geometry']['BoundingBox'],width,height, 'blue')    
-   
-            #uncomment to draw polygon for all Blocks
-            #points=[]
-            #for polygon in block['Geometry']['Polygon']:
-            #    points.append((width * polygon['X'], height * polygon['Y']))
-            #draw.polygon((points), outline='blue')
-            
-    # Display the image
-    image.show()
-    return len(blocks)
-
-
-def main():
-
-    bucket = ''
-    document = ''
-    block_count=process_text_analysis(bucket,document)
-    print("Blocks detected: " + str(block_count))
-    
-if __name__ == "__main__":
-    main()
+    def parse_data(self):
+        self.date = self.parse_date("LINE")
+        return self.date
+        # rncs = get_rnc("LINE")
+        # ncf = get_ncf("LINE")
+        # total = get_total("LINE")
